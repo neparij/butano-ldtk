@@ -112,3 +112,9 @@ class TilesetPaletteManualRequiresIndexedImageException(Exception):
         )
         self.tileset = tileset
         self.mode = mode
+
+
+class TilesetBgAnimationException(Exception):
+    def __init__(self, tileset: str, message: str):
+        super().__init__(f'Tileset "{tileset}" tile animation: {message}')
+        self.tileset = tileset

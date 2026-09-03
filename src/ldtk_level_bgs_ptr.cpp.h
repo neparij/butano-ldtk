@@ -380,6 +380,16 @@ auto level_bgs_ptr::visible(gen::layer_ident layer_identifier) const -> bool
     return level_bgs_manager::visible(_handle, layer_identifier);
 }
 
+void level_bgs_ptr::remove_background(gen::layer_ident layer_identifier)
+{
+    level_bgs_manager::remove_background(_handle, layer_identifier);
+}
+
+void level_bgs_ptr::recreate_background(gen::layer_ident layer_identifier)
+{
+    level_bgs_manager::recreate_background(_handle, layer_identifier);
+}
+
 void level_bgs_ptr::set_visible(bool visible)
 {
     level_bgs_manager::set_visible(_handle, visible);

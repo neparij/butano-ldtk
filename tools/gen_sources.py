@@ -3,12 +3,19 @@
 
 from models import *
 from convert_exceptions import *
+from tileset_bg_animation import (
+    MAX_FRAME_RESOLVE_ENTRIES,
+    build_animation_group_payload,
+    try_parse_bg_tile_animation,
+)
 from abc import ABCMeta, abstractmethod
 from io import TextIOWrapper
 from datetime import datetime
 from pathlib import Path
 from enum import Enum
 from typing import Dict, DefaultDict, List, NamedTuple, Tuple, Optional, Generator
+
+from tileset_metatile_dedupe import MetatileDedupePlan, combine_tile_flip, remap_used_tile_index
 
 
 class GenSource(metaclass=ABCMeta):
@@ -764,6 +771,120 @@ class LevelFieldDefinitionsHeader(GenPrivHeader):
             source.write("};\n")
 
 
+class TilesetDefinitionsBgAnimationsHeader(GenPrivHeader):
+    class AnimGroup(NamedTuple):
+        wait_updates: int
+        slots: List[Tuple[int, int, int]]
+        frame_template_tile_1based: List[int]
+
+    @staticmethod
+    def base_file_path() -> Path:
+        return Path("ldtk_gen_priv_tileset_definitions_bg_animations.h")
+
+    def __init__(self):
+        super().__init__()
+        self.add_include("ldtk_tileset_bg_anim.h")
+        self.add_include("cstdint", is_system_header=True)
+
+        self.groups: Dict[str, List[TilesetDefinitionsBgAnimationsHeader.AnimGroup]] = {}
+
+    def add_tileset(
+        self,
+        tileset_def: LdtkJson.TilesetDefinition,
+        tileset_infos: TilesetInfos,
+        ldtk_project: LdtkJson.LdtkJSON,
+        generate_bg_animations: bool = True,
+        metatile_dedupe_plan: Optional[MetatileDedupePlan] = None,
+    ):
+        if not generate_bg_animations:
+            self.groups[tileset_def.identifier] = []
+            return
+
+        groups: List[TilesetDefinitionsBgAnimationsHeader.AnimGroup] = []
+        total_frame_entries = 0
+        for custom_data in tileset_def.custom_data:
+            if not tileset_infos.get_tileset_is_used_tile_id(
+                tileset_def.uid, custom_data.tile_id
+            ):
+                continue
+            try:
+                spec = try_parse_bg_tile_animation(custom_data.data)
+            except ValueError as exc:
+                raise TilesetBgAnimationException(tileset_def.identifier, str(exc)) from exc
+            if spec is None:
+                continue
+            try:
+                slots_t, frame_t1 = build_animation_group_payload(
+                    tileset_def,
+                    tileset_infos,
+                    ldtk_project,
+                    custom_data.tile_id,
+                    spec,
+                    metatile_dedupe_plan=metatile_dedupe_plan,
+                )
+            except ValueError as exc:
+                raise TilesetBgAnimationException(tileset_def.identifier, str(exc)) from exc
+            total_frame_entries += len(frame_t1)
+            groups.append(
+                TilesetDefinitionsBgAnimationsHeader.AnimGroup(
+                    spec.wait_updates, slots_t, frame_t1
+                )
+            )
+        if total_frame_entries > MAX_FRAME_RESOLVE_ENTRIES:
+            raise TilesetBgAnimationException(
+                tileset_def.identifier,
+                f"total animation keyframe cells {total_frame_entries} exceeds "
+                f"{MAX_FRAME_RESOLVE_ENTRIES} (all groups combined)",
+            )
+        self.groups[tileset_def.identifier] = groups
+
+    def _write_contents(self, source: TextIOWrapper):
+        for ident, grps in self.groups.items():
+            if len(grps) == 0:
+                source.write(
+                    f"inline constexpr bn::span<const tileset_bg_anim_group> gen_priv_tileset_{ident}_bg_anim_groups;\n\n"
+                )
+                continue
+
+            for gi, g in enumerate(grps):
+                source.write(
+                    f"inline constexpr const tileset_bg_anim_slot_template gen_priv_tileset_{ident}_bg_anim_g{gi}_slots[] = {{\n"
+                )
+                for tpl, tx, ty in g.slots:
+                    source.write(
+                        f"    tileset_bg_anim_slot_template{{{tpl}, {tx}, {ty}}},\n"
+                    )
+                source.write("};\n\n")
+
+                source.write(
+                    f"inline constexpr const std::uint16_t gen_priv_tileset_{ident}_bg_anim_g{gi}_frame_templates_1based[] = {{"
+                )
+                for i, v in enumerate(g.frame_template_tile_1based):
+                    if i % 12 == 0:
+                        source.write("\n    ")
+                    source.write(f"{v}, ")
+                source.write("\n};\n\n")
+
+            source.write(
+                f"inline constexpr const tileset_bg_anim_group gen_priv_tileset_{ident}_bg_anim_groups_arr[] = {{\n"
+            )
+            for gi, g in enumerate(grps):
+                slot_count = len(g.slots)
+                frame_count = (
+                    len(g.frame_template_tile_1based) // slot_count if slot_count else 0
+                )
+                source.write(
+                    f"    tileset_bg_anim_group{{std::uint8_t({g.wait_updates}), std::uint8_t({slot_count}), "
+                    f"std::uint8_t({frame_count}), gen_priv_tileset_{ident}_bg_anim_g{gi}_slots, "
+                    f"gen_priv_tileset_{ident}_bg_anim_g{gi}_frame_templates_1based}},\n"
+                )
+            source.write("};\n")
+            source.write(
+                f"inline constexpr bn::span<const tileset_bg_anim_group> gen_priv_tileset_{ident}_bg_anim_groups"
+                f"(gen_priv_tileset_{ident}_bg_anim_groups_arr);\n\n"
+            )
+
+
 class TilesetDefinitionsHeader(GenPrivHeader):
     class Tileset(NamedTuple):
         identifier: str
@@ -771,6 +892,7 @@ class TilesetDefinitionsHeader(GenPrivHeader):
         tags_source_enum_id: Optional[str]
         grid_size: int
         uid: int
+        has_anim_atlas: bool
 
     @staticmethod
     def base_file_path() -> Path:
@@ -780,6 +902,7 @@ class TilesetDefinitionsHeader(GenPrivHeader):
         super().__init__()
         self.add_include("ldtk_tileset_definition.h")
         self.add_include("ldtk_gen_priv_tileset_definitions_custom_datas.h")
+        self.add_include("ldtk_gen_priv_tileset_definitions_bg_animations.h")
         self.add_include("ldtk_gen_priv_tileset_definitions_enum_tags.h")
         self.add_include("ldtk_gen_priv_tileset_definitions_tags.h")
         self.add_include("ldtk_gen_idents.h")
@@ -793,14 +916,29 @@ class TilesetDefinitionsHeader(GenPrivHeader):
         tileset_def: LdtkJson.TilesetDefinition,
         tileset_infos: TilesetInfos,
         enum_infos: EnumInfos,
+        generate_bg_animations: bool = True,
+        metatile_dedupe_plan: Optional[MetatileDedupePlan] = None,
     ):
         self.add_include(
             f"bn_regular_bg_items_ldtk_gen_priv_tileset_{tileset_def.identifier}.h"
         )
+        has_anim_atlas = (
+            tileset_infos.get_tileset_anim_tiles_count(tileset_def.uid) > 0
+            and generate_bg_animations
+        )
+        if has_anim_atlas:
+            self.add_include(
+                f"bn_regular_bg_items_ldtk_gen_priv_tileset_{tileset_def.identifier}_anim.h"
+            )
+        used_tile_count = (
+            metatile_dedupe_plan.new_used_count
+            if metatile_dedupe_plan is not None
+            else tileset_infos.get_tileset_used_tiles_count(tileset_def.uid)
+        )
         self.tilesets.append(
             TilesetDefinitionsHeader.Tileset(
                 tileset_def.identifier,
-                tileset_infos.get_tileset_used_tiles_count(tileset_def.uid),
+                used_tile_count,
                 (
                     enum_infos.get_enum_name_with_uid(tileset_def.tags_source_enum_uid)
                     if tileset_def.tags_source_enum_uid is not None
@@ -808,6 +946,7 @@ class TilesetDefinitionsHeader(GenPrivHeader):
                 ),
                 tileset_def.tile_grid_size,
                 tileset_def.uid,
+                has_anim_atlas,
             )
         )
 
@@ -838,7 +977,13 @@ class TilesetDefinitionsHeader(GenPrivHeader):
                     f'        {f"bn::type_id<{tileset.tags_source_enum_id}>()" if tileset.tags_source_enum_id is not None else "bn::nullopt"},\n'
                 )
                 source.write(f"        {tileset.grid_size},\n")
-                source.write(f"        {tileset.uid}\n")
+                source.write(f"        {tileset.uid},\n")
+                source.write(
+                    f"        gen_priv_tileset_{tileset.identifier}_bg_anim_groups,\n"
+                )
+                source.write(
+                    f"        {f'&bn::regular_bg_items::ldtk_gen_priv_tileset_{tileset.identifier}_anim' if tileset.has_anim_atlas else 'nullptr'}\n"
+                )
                 source.write("    ),\n")
             source.write("};\n")
 
@@ -862,20 +1007,31 @@ class TilesetDefinitionsCustomDatasHeader(GenPrivHeader):
         """Tileset identifier -> List[CustomData]"""
 
     def add_tileset(
-        self, tileset_def: LdtkJson.TilesetDefinition, tileset_infos: TilesetInfos
+        self,
+        tileset_def: LdtkJson.TilesetDefinition,
+        tileset_infos: TilesetInfos,
+        metatile_dedupe_plan: Optional[MetatileDedupePlan] = None,
     ):
-        self.custom_datas[tileset_def.identifier] = [
-            TilesetDefinitionsCustomDatasHeader.CustomData(
-                custom_data.data,
-                tileset_infos.get_tileset_used_tile_id_to_idx(
-                    tileset_def.uid, custom_data.tile_id
-                ),
-            )
-            for custom_data in tileset_def.custom_data
-            if tileset_infos.get_tileset_is_used_tile_id(
+        filtered: List[TilesetDefinitionsCustomDatasHeader.CustomData] = []
+        for custom_data in tileset_def.custom_data:
+            if not tileset_infos.get_tileset_is_used_tile_id(
+                tileset_def.uid, custom_data.tile_id
+            ):
+                continue
+            if try_parse_bg_tile_animation(custom_data.data) is not None:
+                continue
+            uidx = tileset_infos.get_tileset_used_tile_id_to_idx(
                 tileset_def.uid, custom_data.tile_id
             )
-        ]
+            if metatile_dedupe_plan is not None:
+                uidx = metatile_dedupe_plan.old_to_new[uidx]
+            filtered.append(
+                TilesetDefinitionsCustomDatasHeader.CustomData(
+                    custom_data.data,
+                    uidx,
+                )
+            )
+        self.custom_datas[tileset_def.identifier] = filtered
 
     def _write_contents(self, source: TextIOWrapper):
         for tileset_ident, custom_datas in self.custom_datas.items():
@@ -949,17 +1105,28 @@ class TilesetDefinitionsEnumTagTileIndexesHeader(GenPrivHeader):
         """(tileset ident, enum value str) -> List[tile idx]"""
 
     def add_tileset(
-        self, tileset_def: LdtkJson.TilesetDefinition, tileset_infos: TilesetInfos
+        self,
+        tileset_def: LdtkJson.TilesetDefinition,
+        tileset_infos: TilesetInfos,
+        metatile_dedupe_plan: Optional[MetatileDedupePlan] = None,
     ):
         for enum_tag in tileset_def.enum_tags:
             key = TilesetDefinitionsEnumTagTileIndexesHeader.Key(
                 tileset_def.identifier, enum_tag.enum_value_id
             )
-            self.tile_indexes[key] = [
-                tileset_infos.get_tileset_used_tile_id_to_idx(tileset_def.uid, tile_id)
-                for tile_id in enum_tag.tile_ids
-                if tileset_infos.get_tileset_is_used_tile_id(tileset_def.uid, tile_id)
-            ]
+            idxs: List[int] = []
+            for tile_id in enum_tag.tile_ids:
+                if not tileset_infos.get_tileset_is_used_tile_id(
+                    tileset_def.uid, tile_id
+                ):
+                    continue
+                uidx = tileset_infos.get_tileset_used_tile_id_to_idx(
+                    tileset_def.uid, tile_id
+                )
+                if metatile_dedupe_plan is not None:
+                    uidx = metatile_dedupe_plan.old_to_new[uidx]
+                idxs.append(uidx)
+            self.tile_indexes[key] = idxs
 
     def _write_contents(self, source: TextIOWrapper):
         for key, tile_indexes in self.tile_indexes.items():
@@ -1630,8 +1797,12 @@ class LayerAutoLayerTilesCellsHeader(GenPrivHeader):
         level_ident: str,
         layer: LdtkJson.LayerInstance,
         tileset_infos: TilesetInfos,
+        metatile_dedupe_plan: Optional[MetatileDedupePlan] = None,
     ):
         assert layer.tileset_def_uid is not None and len(tiles) != 0
+
+        uid = layer.tileset_def_uid
+        tile_px = tileset_infos.get_tileset_def(uid).tile_grid_size
 
         # Determine whether to use `u8` or `u16` for cell storage
         bloated = False
@@ -1641,8 +1812,11 @@ class LayerAutoLayerTilesCellsHeader(GenPrivHeader):
             pos = Point(tile.px[0] // layer.grid_size, tile.px[1] // layer.grid_size)
             if pos not in pre_used_pos:
                 pre_used_pos.add(pos)
-                tile_idx = tileset_infos.get_tileset_used_tile_idx(
-                    layer.tileset_def_uid, src
+                old_idx = tileset_infos.get_tileset_used_tile_idx(uid, src)
+                tile_idx = (
+                    remap_used_tile_index(metatile_dedupe_plan, old_idx)
+                    if metatile_dedupe_plan is not None
+                    else old_idx
                 )
                 if tile_idx >= (1 << 6):
                     bloated = True
@@ -1658,15 +1832,24 @@ class LayerAutoLayerTilesCellsHeader(GenPrivHeader):
                 continue
             pos_1 = pos.y * layer.c_wid + pos.x
             if cells[pos_1] == 0:
-                cells[pos_1] = 1 + tileset_infos.get_tileset_used_tile_idx(
-                    layer.tileset_def_uid, src
+                old_idx = tileset_infos.get_tileset_used_tile_idx(uid, src)
+                new_idx = (
+                    remap_used_tile_index(metatile_dedupe_plan, old_idx)
+                    if metatile_dedupe_plan is not None
+                    else old_idx
                 )
+                f_ldtk = (
+                    combine_tile_flip(metatile_dedupe_plan, old_idx, tile.f, tile_px)
+                    if metatile_dedupe_plan is not None
+                    else tile.f
+                )
+                cells[pos_1] = 1 + new_idx
                 if bloated:
                     assert 1 <= cells[pos_1] < (1 << 14)
                 else:
                     assert 1 <= cells[pos_1] < (1 << 6)
                 # Apply flipping
-                cells[pos_1] |= tile.f << (14 if bloated else 6)
+                cells[pos_1] |= f_ldtk << (14 if bloated else 6)
 
         self.cells.append(
             LayerAutoLayerTilesCellsHeader.CellsInfo(

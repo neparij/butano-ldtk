@@ -226,6 +226,16 @@ class TilesetInfos:
                             overlapped_pos.add(pos)
                             used_tiles.add(Point(tile.src[0], tile.src[1]))
 
+        # BG animation frame tiles go to a separate *_anim grit (not level VRAM budget).
+        from tileset_bg_animation import collect_bg_animation_tile_srcs_per_tileset
+
+        self.__anim_tile_srcs: List[List[Point]] = collect_bg_animation_tile_srcs_per_tileset(
+            ldtk_project, tilesets_used_tiles
+        )
+        self.__anim_tile_idxes: List[Dict[Point, int]] = [
+            {p: i for i, p in enumerate(lst)} for lst in self.__anim_tile_srcs
+        ]
+
         self.__tileset_uid_to_idx: Dict[int, int] = tileset_uid_to_idx
         self.__tileset_idx_to_def: Dict[int, LdtkJson.TilesetDefinition] = (
             tileset_idx_to_def
@@ -261,11 +271,26 @@ class TilesetInfos:
     def get_tileset_used_tile_src(self, tileset_uid: int, tile_idx: int) -> Point:
         return self.__used_tile_srcs[self.get_tileset_idx(tileset_uid)][tile_idx]
 
+    def get_tileset_anim_tiles_count(self, tileset_uid: int) -> int:
+        return len(self.__anim_tile_srcs[self.get_tileset_idx(tileset_uid)])
+
+    def get_tileset_anim_tile_src(self, tileset_uid: int, tile_idx: int) -> Point:
+        return self.__anim_tile_srcs[self.get_tileset_idx(tileset_uid)][tile_idx]
+
+    def get_tileset_anim_contains_ldtk_tile_id(self, tileset_uid: int, tile_id: int) -> bool:
+        tile_src = self.__get_tile_src(tileset_uid, tile_id)
+        return tile_src in self.__anim_tile_idxes[self.get_tileset_idx(tileset_uid)]
+
+    def get_tileset_anim_tile_id_to_idx(self, tileset_uid: int, tile_id: int) -> int:
+        tile_src = self.__get_tile_src(tileset_uid, tile_id)
+        return self.__anim_tile_idxes[self.get_tileset_idx(tileset_uid)][tile_src]
+
     def __get_tile_src(self, tileset_uid: int, tile_id: int):
         tileset_def = self.get_tileset_def(tileset_uid)
         grid_x = tile_id % tileset_def.c_wid
         grid_y = tile_id // tileset_def.c_wid
-        square_diff = tileset_def.tile_grid_size + tileset_def.padding
+        # LDtk: origin uses border padding; stride between tile origins uses spacing.
+        square_diff = tileset_def.tile_grid_size + tileset_def.spacing
         return Point(
             tileset_def.padding + grid_x * square_diff,
             tileset_def.padding + grid_y * square_diff,

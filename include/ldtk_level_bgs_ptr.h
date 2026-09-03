@@ -131,6 +131,14 @@ public:
     /// @param layer_identifier identifier of the layer to check if it has a generated background.
     [[nodiscard]] auto has_background(gen::layer_ident layer_identifier) const -> bool;
 
+    /// @brief Destroys the regular BG for a layer and frees its VRAM tiles/map.
+    /// After this call, `has_background(layer_identifier)` returns `false`.
+    void remove_background(gen::layer_ident layer_identifier);
+
+    /// @brief Recreates a previously removed tile layer BG from the current level.
+    /// No-op when the layer already has a background or has no tiles.
+    void recreate_background(gen::layer_ident layer_identifier);
+
     /// @brief Replace the level used by these level backgrounds.
     /// @param level It creates the resources to use by this level.
     void set_level(const level& level);

@@ -52,6 +52,13 @@ void set_level(id_t id, level_bgs_builder&& builder);
 
 auto has_background(id_t id, gen::layer_ident layer_identifier) -> bool;
 
+/// Destroys the regular BG for a layer and frees its VRAM tiles/map. No-op if absent.
+void remove_background(id_t id, gen::layer_ident layer_identifier);
+
+/// Recreates a previously removed tile layer BG from the current level data. No-op if already present
+/// or the layer has no tiles.
+void recreate_background(id_t id, gen::layer_ident layer_identifier);
+
 [[nodiscard]] auto palette(id_t id, gen::layer_ident layer_identifier) -> const bn::bg_palette_ptr&;
 
 void set_palette(id_t id, const bn::bg_palette_ptr& palette);

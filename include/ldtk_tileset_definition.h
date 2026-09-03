@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "ldtk_tileset_bg_anim.h"
 #include "ldtk_tileset_custom_data.h"
 #include "ldtk_tileset_enum_tag.h"
 
@@ -29,10 +30,12 @@ public:
                                  bn::span<const tileset_custom_data> custom_data,
                                  bn::span<const tileset_enum_tag> enum_tags, gen::tileset_ident identifier,
                                  bn::span<const gen::tileset_tag> tags, bn::optional<bn::type_id_t> tags_source_enum_id,
-                                 int tile_grid_size, int uid)
+                                 int tile_grid_size, int uid, bn::span<const tileset_bg_anim_group> bg_anim_groups,
+                                 const bn::regular_bg_item* anim_bg_item)
         : _bg_item(bg_item), _tiles_count(tiles_count), _custom_data(custom_data), _enum_tags(enum_tags),
           _identifier(identifier), _tags(tags), _tags_source_enum_id(tags_source_enum_id),
-          _tile_grid_size(tile_grid_size), _uid(uid)
+          _tile_grid_size(tile_grid_size), _uid(uid), _bg_anim_groups(bg_anim_groups),
+          _anim_bg_item(anim_bg_item)
     {
     }
     /// @endcond
@@ -133,6 +136,19 @@ public:
         return _uid;
     }
 
+    /// @brief Precomputed tile background animations (from LDtk tileset customData).
+    [[nodiscard]] constexpr auto bg_anim_groups() const -> bn::span<const tileset_bg_anim_group>
+    {
+        return _bg_anim_groups;
+    }
+
+    /// @brief Optional second grit (``*_anim``) holding only tiles used as BG animation frames.
+    /// @return nullptr when this tileset has no BG animation atlas.
+    [[nodiscard]] constexpr auto anim_bg_item() const -> const bn::regular_bg_item*
+    {
+        return _anim_bg_item;
+    }
+
 private:
     const bn::regular_bg_item& _bg_item;
 
@@ -144,6 +160,8 @@ private:
     bn::optional<bn::type_id_t> _tags_source_enum_id;
     int _tile_grid_size;
     int _uid;
+    bn::span<const tileset_bg_anim_group> _bg_anim_groups;
+    const bn::regular_bg_item* _anim_bg_item;
 };
 
 } // namespace ldtk
