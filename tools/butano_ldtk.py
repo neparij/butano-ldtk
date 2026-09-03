@@ -6,9 +6,15 @@
 from pathlib import Path
 import LdtkJson
 from gen_sources import *
-from typing import Final, Any
+from typing import Any, Dict, Final, Optional
 from PIL import Image
 import math
+
+from tileset_anim_grit_stubs import apply_anim_grit_stubs_to_main_strip
+from tileset_metatile_dedupe import (
+    MetatileDedupePlan,
+    build_metatile_dedupe_plans,
+)
 
 
 def create_folder(folder_path: Path):
@@ -286,18 +292,36 @@ def generate_tilesets_bg_items(
     ldtk_project_folder_path: Path,
     build_folder_path: Path,
     tileset_palette_manual: bool,
+    generate_bg_animations: bool = True,
+    metatile_dedupe_plans: Optional[Dict[int, MetatileDedupePlan]] = None,
+    tileset_deduplication: bool = False,
 ):
+    """Build ``ldtk_gen_priv_tileset_*`` and, when BG animations need it, ``*_anim`` BMPs.
+
+    When a tileset has BG animation tiles, one stacked canvas is used: level-used tiles on
+    top, animation atlas below (same layout as a standalone ``*_anim`` sheet). One
+    quantization (auto) or one indexed paste (manual palette) applies to the full canvas;
+    then the top and bottom crops are saved as the main and anim tilesets so both share the
+    same palette and color budget.
+
+    With ``--generate-bg-animations``, every 8×8 cell of **animation-participating** metatiles on
+    the main strip is overwritten with a unique indexed noise pattern so grit does not merge
+    those slots with visually identical non-animation tiles (see ``tileset_anim_grit_stubs``).
+    """
     TRANSPARENT_COLOR: Final[str] = "#00FF0000"
 
     TILESET_BG_WIDTH: Final[int] = 256
-    # BG width is large at first to ensure the "dominant" transparent color
-    # ends up the first entry of the quantized palette.
-    TEMP_LARGE_WIDTH: Final[int] = TILESET_BG_WIDTH * 2 + 1
-    # BG height is always multiple of this.
     TILESET_BG_HEIGHT_UNIT: Final[int] = 256
 
+    plans: Dict[int, MetatileDedupePlan] = metatile_dedupe_plans or {}
+
     for tileset_def in ldtk_project.defs.tilesets:
-        tiles_count = tileset_infos.get_tileset_used_tiles_count(tileset_def.uid)
+        plan = plans.get(tileset_def.uid)
+        tiles_count = (
+            plan.new_used_count
+            if plan is not None
+            else tileset_infos.get_tileset_used_tiles_count(tileset_def.uid)
+        )
 
         if tileset_def.rel_path is None:
             assert isinstance(tileset_def.embed_atlas, LdtkJson.EmbedAtlas)
@@ -317,12 +341,35 @@ def generate_tilesets_bg_items(
         tileset_out_path: Path = build_folder_path.joinpath(
             f"graphics/ldtk_gen_priv_tileset_{tileset_def.identifier}"
         )
+        anim_out_path: Path = build_folder_path.joinpath(
+            f"graphics/ldtk_gen_priv_tileset_{tileset_def.identifier}_anim"
+        )
 
         tile_size = tileset_def.tile_grid_size
         tiles_count_per_height_unit = 1024 / ((tile_size >> 3) ** 2)
-        tileset_bg_height = TILESET_BG_HEIGHT_UNIT * math.ceil(
+        main_h = TILESET_BG_HEIGHT_UNIT * math.ceil(
             (1 + tiles_count) / tiles_count_per_height_unit
         )
+
+        anim_n = tileset_infos.get_tileset_anim_tiles_count(tileset_def.uid)
+        has_anim = (
+            anim_n > 0
+            and tileset_src_path is not None
+            and tileset_def.rel_path is not None
+            and generate_bg_animations
+        )
+        if has_anim and anim_n >= (1 << 14):
+            raise TooManyUsedTilesInTilesetException(
+                anim_n, f"{tileset_def.identifier}_anim"
+            )
+
+        anim_h = (
+            TILESET_BG_HEIGHT_UNIT
+            * math.ceil((1 + anim_n) / tiles_count_per_height_unit)
+            if has_anim
+            else 0
+        )
+        combined_h = main_h + anim_h
 
         use_palette_manual = tileset_palette_manual and tileset_src_path is not None
         bpp_mode = "bpp_4_manual" if use_palette_manual else "bpp_4_auto"
@@ -334,8 +381,56 @@ def generate_tilesets_bg_items(
                 paste_x -= TILESET_BG_WIDTH
                 paste_y += 8
 
-            for i in range(tileset_infos.get_tileset_used_tiles_count(tileset_def.uid)):
-                src = tileset_infos.get_tileset_used_tile_src(tileset_def.uid, i)
+            if plan is not None:
+                for new_i in range(plan.new_used_count):
+                    can = plan.canonical_metatiles[new_i]
+                    for y in range(tile_size >> 3):
+                        for x in range(tile_size >> 3):
+                            sub_x = x * 8
+                            sub_y = y * 8
+                            tile = can.crop(
+                                (sub_x, sub_y, sub_x + 8, sub_y + 8)
+                            )
+                            tileset_bg.paste(tile, (paste_x, paste_y))
+
+                            paste_x += 8
+                            if paste_x >= TILESET_BG_WIDTH:
+                                assert paste_x == TILESET_BG_WIDTH
+                                paste_x = 0
+                                paste_y += 8
+            else:
+                for i in range(
+                    tileset_infos.get_tileset_used_tiles_count(tileset_def.uid)
+                ):
+                    src = tileset_infos.get_tileset_used_tile_src(tileset_def.uid, i)
+                    for y in range(tile_size >> 3):
+                        for x in range(tile_size >> 3):
+                            sub_x = src.x + x * 8
+                            sub_y = src.y + y * 8
+                            tile = tileset_src.crop(
+                                (sub_x, sub_y, sub_x + 8, sub_y + 8)
+                            )
+                            tileset_bg.paste(tile, (paste_x, paste_y))
+
+                            paste_x += 8
+                            if paste_x >= TILESET_BG_WIDTH:
+                                assert paste_x == TILESET_BG_WIDTH
+                                paste_x = 0
+                                paste_y += 8
+
+        def paste_anim_tiles_into(
+            tileset_bg: Image.Image,
+            tileset_src: Image.Image,
+            start_y: int = 0,
+        ) -> None:
+            paste_x, paste_y = ((tile_size >> 3) ** 2) * 8, start_y
+            while paste_x >= TILESET_BG_WIDTH:
+                paste_x -= TILESET_BG_WIDTH
+                paste_y += 8
+
+            uid = tileset_def.uid
+            for i in range(anim_n):
+                src = tileset_infos.get_tileset_anim_tile_src(uid, i)
                 for y in range(tile_size >> 3):
                     for x in range(tile_size >> 3):
                         sub_x = src.x + x * 8
@@ -348,6 +443,20 @@ def generate_tilesets_bg_items(
                             assert paste_x == TILESET_BG_WIDTH
                             paste_x = 0
                             paste_y += 8
+
+        def remap_palette_sort(tileset_bg: Image.Image) -> Image.Image:
+            tileset_palette = tileset_bg.palette
+            if tileset_palette:
+                palette_order = [
+                    color[-1]
+                    for color in sorted(
+                        tileset_palette.colors.items(), reverse=True
+                    )
+                ]
+                palette_order.remove(0)
+                palette_order.insert(0, 0)
+                return tileset_bg.remap_palette(palette_order)
+            return tileset_bg
 
         if use_palette_manual:
             assert tileset_src_path is not None
@@ -365,48 +474,100 @@ def generate_tilesets_bg_items(
 
                 tileset_src.load()  # pyright: ignore[reportUnknownMemberType]
 
-                with Image.new(
-                    "P", (TILESET_BG_WIDTH, tileset_bg_height)
-                ) as tileset_bg:
-                    tileset_bg.putpalette(palette)
-                    tileset_bg.paste(0, (0, 0, TILESET_BG_WIDTH, tileset_bg_height))
-                    paste_used_tiles_into(tileset_bg, tileset_src)
-                    tileset_bg.save(tileset_out_path.with_suffix(".bmp"))
+                if has_anim:
+                    with Image.new(
+                        "P", (TILESET_BG_WIDTH, combined_h)
+                    ) as combined:
+                        combined.putpalette(palette)
+                        combined.paste(0, (0, 0, TILESET_BG_WIDTH, combined_h))
+                        paste_used_tiles_into(combined, tileset_src)
+                        apply_anim_grit_stubs_to_main_strip(
+                            combined,
+                            tileset_infos=tileset_infos,
+                            uid=tileset_def.uid,
+                            tile_px=tile_size,
+                            strip_w_px=TILESET_BG_WIDTH,
+                            tiles_count=tiles_count,
+                            plan=plan,
+                        )
+                        paste_anim_tiles_into(combined, tileset_src, main_h)
+                        top = combined.crop((0, 0, TILESET_BG_WIDTH, main_h))
+                        bot = combined.crop((0, main_h, TILESET_BG_WIDTH, combined_h))
+                        top.save(tileset_out_path.with_suffix(".bmp"))
+                        bot.save(anim_out_path.with_suffix(".bmp"))
+                else:
+                    with Image.new(
+                        "P", (TILESET_BG_WIDTH, main_h)
+                    ) as tileset_bg:
+                        tileset_bg.putpalette(palette)
+                        tileset_bg.paste(0, (0, 0, TILESET_BG_WIDTH, main_h))
+                        paste_used_tiles_into(tileset_bg, tileset_src)
+                        tileset_bg.save(tileset_out_path.with_suffix(".bmp"))
 
         else:  # Use palette auto
-            with Image.new(
-                "RGBA", (TEMP_LARGE_WIDTH, tileset_bg_height), color=TRANSPARENT_COLOR
-            ) as tileset_bg:
-                if tileset_src_path is not None:
+            if has_anim:
+                with Image.new(
+                    "RGBA", (TILESET_BG_WIDTH, combined_h), color=TRANSPARENT_COLOR
+                ) as combined:
+                    assert tileset_src_path is not None
                     with Image.open(tileset_src_path) as tileset_src:
-                        paste_used_tiles_into(tileset_bg, tileset_src)
+                        paste_used_tiles_into(combined, tileset_src)
+                        paste_anim_tiles_into(combined, tileset_src, main_h)
 
-                # Start finalizing the tileset BG
-                tileset_bg = tileset_bg.quantize(256)
-                tileset_bg = tileset_bg.crop(
-                    (0, 0, TILESET_BG_WIDTH, tileset_bg_height)
-                )
+                    combined = combined.quantize(256)
+                    combined = remap_palette_sort(combined)
+                    apply_anim_grit_stubs_to_main_strip(
+                        combined,
+                        tileset_infos=tileset_infos,
+                        uid=tileset_def.uid,
+                        tile_px=tile_size,
+                        strip_w_px=TILESET_BG_WIDTH,
+                        tiles_count=tiles_count,
+                        plan=plan,
+                    )
+                    top = combined.crop((0, 0, TILESET_BG_WIDTH, main_h))
+                    bot = combined.crop((0, main_h, TILESET_BG_WIDTH, combined_h))
+                    top.save(tileset_out_path.with_suffix(".bmp"))
+                    bot.save(anim_out_path.with_suffix(".bmp"))
+            else:
+                with Image.new(
+                    "RGBA", (TILESET_BG_WIDTH, main_h), color=TRANSPARENT_COLOR
+                ) as tileset_bg:
+                    if tileset_src_path is not None:
+                        with Image.open(tileset_src_path) as tileset_src:
+                            paste_used_tiles_into(tileset_bg, tileset_src)
 
-                # Sort the palette in RGB descending order (keeping transparent one)
-                tileset_palette = tileset_bg.palette
-                if tileset_palette:
-                    palette_order = [
-                        color[-1]
-                        for color in sorted(
-                            tileset_palette.colors.items(), reverse=True
-                        )
-                    ]
-                    palette_order.remove(0)
-                    palette_order.insert(0, 0)
-                    tileset_bg = tileset_bg.remap_palette(palette_order)
+                    tileset_bg = tileset_bg.quantize(256)
+                    tileset_bg = tileset_bg.crop(
+                        (0, 0, TILESET_BG_WIDTH, main_h)
+                    )
+                    tileset_bg = remap_palette_sort(tileset_bg)
+                    tileset_bg.save(tileset_out_path.with_suffix(".bmp"))
 
-                # Save it
-                tileset_bg.save(tileset_out_path.with_suffix(".bmp"))
+        grit_no_dedupe = (
+            '"repeated_tiles_reduction":false,"flipped_tiles_reduction":false'
+            if tileset_deduplication
+            else ""
+        )
+        main_json_inner = f'"type":"regular_bg","bpp_mode":"{bpp_mode}"'
+        if tileset_deduplication:
+            main_json_inner += f",{grit_no_dedupe}"
 
         with tileset_out_path.with_suffix(".json").open(
             "w", encoding="utf-8"
         ) as tileset_json:
-            tileset_json.write(f'{{"type":"regular_bg","bpp_mode":"{bpp_mode}"}}')
+            tileset_json.write(f"{{{main_json_inner}}}")
+
+        if has_anim:
+            anim_json_inner = f'"type":"regular_bg","bpp_mode":"{bpp_mode}"'
+            if tileset_deduplication:
+                anim_json_inner += f",{grit_no_dedupe}"
+            else:
+                anim_json_inner += ',"flipped_tiles_reduction":false'
+            with anim_out_path.with_suffix(".json").open(
+                "w", encoding="utf-8"
+            ) as anim_tileset_json:
+                anim_tileset_json.write(f"{{{anim_json_inner}}}")
 
 
 def generate_tileset_definitions(
@@ -414,21 +575,36 @@ def generate_tileset_definitions(
     tileset_infos: TilesetInfos,
     ldtk_project: LdtkJson.LdtkJSON,
     build_folder_path: Path,
+    generate_bg_animations: bool = True,
+    metatile_dedupe_plans: Optional[Dict[int, MetatileDedupePlan]] = None,
 ):
+    plans: Dict[int, MetatileDedupePlan] = metatile_dedupe_plans or {}
     custom_datas_header = TilesetDefinitionsCustomDatasHeader()
+    bg_animations_header = TilesetDefinitionsBgAnimationsHeader()
     enum_tags_header = TilesetDefinitionsEnumTagsHeader()
     enum_tag_tile_indexes_header = TilesetDefinitionsEnumTagTileIndexesHeader()
     tags_header = TilesetDefinitionsTagsHeader()
     defs_header = TilesetDefinitionsHeader()
 
     for tileset_def in ldtk_project.defs.tilesets:
-        custom_datas_header.add_tileset(tileset_def, tileset_infos)
+        p = plans.get(tileset_def.uid)
+        custom_datas_header.add_tileset(tileset_def, tileset_infos, p)
+        bg_animations_header.add_tileset(
+            tileset_def,
+            tileset_infos,
+            ldtk_project,
+            generate_bg_animations,
+            metatile_dedupe_plan=p,
+        )
         enum_tags_header.add_tileset(tileset_def)
-        enum_tag_tile_indexes_header.add_tileset(tileset_def, tileset_infos)
+        enum_tag_tile_indexes_header.add_tileset(tileset_def, tileset_infos, p)
         tags_header.add_tileset(tileset_def)
-        defs_header.add_tileset(tileset_def, tileset_infos, enum_infos)
+        defs_header.add_tileset(
+            tileset_def, tileset_infos, enum_infos, generate_bg_animations, p
+        )
 
     custom_datas_header.write(build_folder_path)
+    bg_animations_header.write(build_folder_path)
     enum_tags_header.write(build_folder_path)
     enum_tag_tile_indexes_header.write(build_folder_path)
     tags_header.write(build_folder_path)
@@ -538,9 +714,16 @@ def generate_definitions_headers(
     tileset_infos: TilesetInfos,
     ldtk_project: LdtkJson.LdtkJSON,
     build_folder_path: Path,
+    generate_bg_animations: bool = True,
+    metatile_dedupe_plans: Optional[Dict[int, MetatileDedupePlan]] = None,
 ):
     generate_tileset_definitions(
-        enum_infos, tileset_infos, ldtk_project, build_folder_path
+        enum_infos,
+        tileset_infos,
+        ldtk_project,
+        build_folder_path,
+        generate_bg_animations,
+        metatile_dedupe_plans=metatile_dedupe_plans,
     )
     generate_level_field_definitions(ldtk_project, build_folder_path)
     generate_layer_definitions(ldtk_project, build_folder_path)
@@ -554,6 +737,7 @@ def generate_levels_headers(
     tileset_infos: TilesetInfos,
     ldtk_project: LdtkJson.LdtkJSON,
     build_folder_path: Path,
+    metatile_dedupe_plans: Optional[Dict[int, MetatileDedupePlan]] = None,
 ):
     level_fields_header = LevelFieldInstancesHeader()
     level_field_arrays_header = LevelFieldArraysHeader()
@@ -581,6 +765,8 @@ def generate_levels_headers(
         entity_def.uid: idx for idx, entity_def in enumerate(ldtk_project.defs.entities)
     }
     """Entity def uid -> def idx"""
+
+    dedupe_plans: Dict[int, MetatileDedupePlan] = metatile_dedupe_plans or {}
 
     entity_field_def_lut: Dict[int, LdtkJson.FieldDefinition] = {}
     """Entity field def uid -> field def"""
@@ -626,13 +812,21 @@ def generate_levels_headers(
                 if len(layer.auto_layer_tiles) != 0:
                     auto_layer_tiles_header.add_grid(level.identifier, layer)
                     auto_layer_tiles_cells_header.add_tiles(
-                        layer.auto_layer_tiles, level.identifier, layer, tileset_infos
+                        layer.auto_layer_tiles,
+                        level.identifier,
+                        layer,
+                        tileset_infos,
+                        dedupe_plans.get(layer.tileset_def_uid),
                     )
 
                 if len(layer.grid_tiles) != 0:
                     grid_tiles_header.add_grid(level.identifier, layer)
                     grid_tiles_cells_header.add_tiles(
-                        layer.grid_tiles, level.identifier, layer, tileset_infos
+                        layer.grid_tiles,
+                        level.identifier,
+                        layer,
+                        tileset_infos,
+                        dedupe_plans.get(layer.tileset_def_uid),
                     )
 
             # IntGrid
@@ -691,6 +885,8 @@ def process_ldtk(
     build_folder_path: Path,
     tileset_palette_manual: bool = False,
     additional_ignore_tilesets: Optional[List[str]] = None,
+    generate_bg_animations: bool = True,
+    tileset_deduplication: bool = False,
 ) -> bool:
     """Returns `False` if the process is skipped, because there's no modification"""
     try:
@@ -715,17 +911,37 @@ def process_ldtk(
 
         enum_infos = EnumInfos(ldtk_project)
         tileset_infos = TilesetInfos(ldtk_project)
+        metatile_dedupe_plans = build_metatile_dedupe_plans(
+            ldtk_project,
+            tileset_infos,
+            ldtk_project_folder_path,
+            enabled=tileset_deduplication,
+            generate_bg_animations=generate_bg_animations,
+        )
         generate_tilesets_bg_items(
             tileset_infos,
             ldtk_project,
             ldtk_project_folder_path,
             build_folder_path,
             tileset_palette_manual,
+            generate_bg_animations,
+            metatile_dedupe_plans=metatile_dedupe_plans,
+            tileset_deduplication=tileset_deduplication,
         )
         generate_definitions_headers(
-            enum_infos, tileset_infos, ldtk_project, build_folder_path
+            enum_infos,
+            tileset_infos,
+            ldtk_project,
+            build_folder_path,
+            generate_bg_animations,
+            metatile_dedupe_plans=metatile_dedupe_plans,
         )
-        generate_levels_headers(tileset_infos, ldtk_project, build_folder_path)
+        generate_levels_headers(
+            tileset_infos,
+            ldtk_project,
+            build_folder_path,
+            metatile_dedupe_plans=metatile_dedupe_plans,
+        )
 
         # This one should be last, because functions above might sort identifiers
         generate_enum_headers(ldtk_project, build_folder_path)
@@ -766,17 +982,42 @@ if __name__ == "__main__":
             "Example: --ignore-tilesets ldtk_only debug_tiles"
         ),
     )
+    parser.add_argument(
+        "--generate-bg-animations",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Generate BG animation tile atlases and related files."
+        ),
+    )
+    parser.add_argument(
+        "--tileset-deduplication",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Remap meta-tiles to a compact atlas (identity + flip equivalence), update maps "
+            "and tile indices, and emit grit JSON with repeated_tiles_reduction / "
+            "flipped_tiles_reduction disabled. "
+            "If omitted, defaults to the same value as --generate-bg-animations."
+        ),
+    )
 
     try:
         args = parser.parse_args()
         ldtk_project_file_path = Path(args.input)
         build_folder_path = Path(args.build)
 
+        dedupe = args.tileset_deduplication
+        if dedupe is None:
+            dedupe = args.generate_bg_animations
+
         if process_ldtk(
             ldtk_project_file_path,
             build_folder_path,
             tileset_palette_manual=args.tileset_palette_manual,
             additional_ignore_tilesets=args.ignore_tilesets,
+            generate_bg_animations=args.generate_bg_animations,
+            tileset_deduplication=dedupe,
         ):
             print(
                 f'Successfully converted LDtk project "{ldtk_project_file_path}" to "{build_folder_path}"'

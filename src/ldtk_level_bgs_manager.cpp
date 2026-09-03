@@ -9,6 +9,7 @@
 #include "ldtk_gen_idents_fwd.h"
 #include "ldtk_layer.h"
 #include "ldtk_tile_grid_t.h"
+#include "ldtk_tileset_bg_anim.h"
 #include "ldtk_tileset_definition.h"
 
 #include <bn_assert.h>
@@ -22,6 +23,7 @@
 #include <bn_point.h>
 #include <bn_pool.h>
 #include <bn_regular_bg_builder.h>
+#include <bn_regular_bg_item.h>
 #include <bn_regular_bg_map_cell.h>
 #include <bn_regular_bg_map_cell_info.h>
 #include <bn_regular_bg_map_item.h>
@@ -61,6 +63,9 @@ struct bg_t
     bn::regular_bg_map_item map_item;
     bn::regular_bg_ptr bg_ptr;
     bn::regular_bg_map_ptr map_ptr;
+
+    bool has_tile_anim = false;
+    tileset_bg_anim_controller tile_anim;
 
     bg_t(const level& lv_, const layer& layer_, const bn::fixed_point& cam_applied_pos, const level_bgs_builder&);
 
@@ -113,6 +118,9 @@ struct lv_t
     auto get_bg(gen::layer_ident layer_identifier) const -> const bg_t&;
     auto get_bg_nullable(gen::layer_ident layer_identifier) -> bg_t*;
     auto get_bg_nullable(gen::layer_ident layer_identifier) const -> const bg_t*;
+
+    void remove_background(gen::layer_ident layer_identifier);
+    void recreate_background(gen::layer_ident layer_identifier);
 };
 
 struct static_data
@@ -164,15 +172,27 @@ bg_t::bg_t(const level& lv_, const layer& layer_, const bn::fixed_point& cam_app
       oob_tile(builder.out_of_bound_tile_info(layer_.identifier())), map_item(cells[0], bn::size(COLUMNS, ROWS)),
       bg_ptr(init_bg_ptr(layer_, cam_applied_pos, builder)), map_ptr(bg_ptr.map())
 {
+    if(const tileset_definition* ts = layer_.tileset_def())
+    {
+        if(!ts->bg_anim_groups().empty())
+        {
+            tile_anim.set_context(*ts, bn::regular_bg_tiles_ptr(bg_ptr.tiles()), layer_.grid_size(), cells,
+                                    COLUMNS * ROWS);
+            has_tile_anim = true;
+            map_ptr.reload_cells_ref();
+        }
+    }
 }
 
 void bg_t::update(const bn::fixed_point& next_cam_applied_pos, const bn::fixed_point& prev_cam_applied_pos)
 {
+    bool should_reload_cells = false;
     if (next_visible)
     {
         if (force_reload || !bg_ptr.visible())
         {
             update_all_cells(next_cam_applied_pos);
+            should_reload_cells = true;
             force_reload = false;
         }
         // Update cells when level position changed
@@ -180,7 +200,17 @@ void bg_t::update(const bn::fixed_point& next_cam_applied_pos, const bn::fixed_p
         {
             // Only update cells that needs to be changed
             update_part_cells(next_cam_applied_pos, prev_cam_applied_pos);
+            should_reload_cells = true;
         }
+
+        if(has_tile_anim && tile_anim.update())
+        {
+            should_reload_cells = true;
+        }
+    }
+
+    if (should_reload_cells) {
+        map_ptr.reload_cells_ref();
     }
 
     update_camera_applied_position(next_cam_applied_pos);
@@ -202,13 +232,11 @@ void bg_t::update_camera_applied_position(const bn::fixed_point& cam_applied_pos
 void bg_t::update_all_cells(const bn::fixed_point& cam_applied_pos)
 {
     reset_all_cells(apply_layer_diff(cam_applied_pos));
-    map_ptr.reload_cells_ref();
 }
 
 void bg_t::update_part_cells(const bn::fixed_point& next_cam_applied_pos, const bn::fixed_point& prev_cam_applied_pos)
 {
     reset_part_cells(apply_layer_diff(next_cam_applied_pos), apply_layer_diff(prev_cam_applied_pos));
-    map_ptr.reload_cells_ref();
 }
 
 void bg_t::reset_all_cells(const bn::fixed_point& final_pos)
@@ -225,6 +253,11 @@ void bg_t::reset_all_cells(const bn::fixed_point& final_pos)
     const bn::point level_8x8_last(level_8x8_first + SCREEN_CELLS);
 
     reset_rows(level_8x8_first.y(), level_8x8_last.y(), level_8x8_first.x(), level_8x8_last.x());
+
+    if(has_tile_anim)
+    {
+        tile_anim.sync_map_palettes();
+    }
 }
 
 void bg_t::reset_part_cells(const bn::fixed_point& next_final_pos, const bn::fixed_point& prev_final_pos)
@@ -248,6 +281,7 @@ void bg_t::reset_part_cells(const bn::fixed_point& next_final_pos, const bn::fix
     const int down_diff = -up_diff;
     const int left_diff = -level_8x8_next_top_left.x() + level_8x8_prev_top_left.x();
     const int right_diff = -left_diff;
+    // const bool diff = (up_diff != 0 || left_diff != 0);
 
     // If `diff` is over the screen size, you can actually overwrite the same cell twice.
     // If we're moving left or up, the last overwritting one will be the wrong source tile.
@@ -256,6 +290,11 @@ void bg_t::reset_part_cells(const bn::fixed_point& next_final_pos, const bn::fix
     if (bn::abs(up_diff) >= SCREEN_CELLS.y() || bn::abs(left_diff) >= SCREEN_CELLS.x())
     {
         reset_all_cells(next_final_pos);
+
+        // TODO: Check
+        if (has_tile_anim) {
+            tile_anim.sync_map_palettes();
+        }
     }
     else
     {
@@ -275,6 +314,11 @@ void bg_t::reset_part_cells(const bn::fixed_point& next_final_pos, const bn::fix
                           level_8x8_next_bottom_right.y() - (down_diff > 0 ? down_diff : 0),
                           level_8x8_next_bottom_right.x() - (right_diff - 1), level_8x8_next_bottom_right.x());
     }
+
+    // if(diff && has_tile_anim)
+    // {
+    //     tile_anim.sync_map_palettes();
+    // }
 }
 
 void bg_t::reset_rows(const int level_8x8_first_y, const int level_8x8_last_y, const int level_8x8_first_x,
@@ -565,6 +609,46 @@ auto lv_t::get_bg_nullable(gen::layer_ident layer_identifier) const -> const bg_
     return nullptr;
 }
 
+void lv_t::remove_background(gen::layer_ident layer_identifier)
+{
+    for (int i = 0; i < bgs.size(); ++i)
+    {
+        if (bgs[i]->layer_instance.identifier() != layer_identifier)
+        {
+            continue;
+        }
+
+        data_ref().bgs_pool.destroy(*bgs[i]);
+        bgs.erase(bgs.begin() + i);
+        return;
+    }
+}
+
+void lv_t::recreate_background(gen::layer_ident layer_identifier)
+{
+    if (get_bg_nullable(layer_identifier) != nullptr)
+    {
+        return;
+    }
+
+    const layer& layer_ = lv->get_layer(layer_identifier);
+    if (! layer_.auto_layer_tiles() && ! layer_.grid_tiles())
+    {
+        return;
+    }
+
+    BN_BASIC_ASSERT(! data_ref().bgs_pool.full(), "No more BG items available");
+
+    level_bgs_builder builder(*lv);
+    builder.set_position(cur_raw_pos);
+    if (cam)
+    {
+        builder.set_camera(*cam);
+    }
+
+    bgs.push_back(&data_ref().bgs_pool.create(*lv, layer_, prev_cam_applied_pos, builder));
+}
+
 } // namespace
 
 void init()
@@ -640,6 +724,16 @@ auto has_background(id_t id, gen::layer_ident layer_identifier) -> bool
 {
     auto lv = static_cast<const lv_t*>(id);
     return lv->get_bg_nullable(layer_identifier) != nullptr;
+}
+
+void remove_background(id_t id, gen::layer_ident layer_identifier)
+{
+    static_cast<lv_t*>(id)->remove_background(layer_identifier);
+}
+
+void recreate_background(id_t id, gen::layer_ident layer_identifier)
+{
+    static_cast<lv_t*>(id)->recreate_background(layer_identifier);
 }
 
 auto palette(id_t id, gen::layer_ident layer_identifier) -> const bn::bg_palette_ptr&
